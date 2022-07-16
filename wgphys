@@ -104,7 +104,7 @@ EOT
     # script by invoking a command like the following (replace WIREGUARD_INTERFACE and IDENTIFIER accordingly):
     # 'wg showconf WIREGUARD_INTERFACE > /etc/wireguard/wgvpn-IDENTIFIER.conf'
     #
-    # For example: In the case of NordVPN run various 'nordvpn connect ...' before running
+    # For example: In the case of NordVPN you might run various 'nordvpn connect ...' before running
     # this script and then dump each Wireguard configuration into a specific configuration file
     # by invoking 'wg showconf nordlynx > /etc/wireguard/wgvpn-countryX.conf'
     # 
