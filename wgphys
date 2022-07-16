@@ -1,0 +1,214 @@
+#!/bin/bash
+# 
+# Move real network interfaces into a namespace called "physical"
+# and configure the network stack accordingly, including name resolution
+#
+# You may place this script into one of the directories listed in the 
+# $PATH variable and then mark it as executable by invoking the command
+# 'chmod +x THIS_SCRIPT_NAME'.
+#
+# Adapted by Tobias Predel in the year 2022 for the NordVPN use case
+# This uses unbound as local DNS resolver that will reside in the physical namespace.
+# DNS resolution for the root namespace will be done via external DNS resolvers..
+#
+# Sources (also worth reading):
+# 1. https://www.wireguard.com/netns/ (especially the section about 
+#    The New Namespace Solution)
+# 2. https://lwn.net/Articles/580893/
+# 3. The network_namespaces(7) manual page (that can be displayed by executing 'man 7 network_namespaces')
+# 4. The ip-netns(8) manual page ('man 8 ip-netns')
+# 
+# Print all commands executed by the shell so it is easier to debug in case
+# of failed commands
+set -ex
+
+# Make sure that this script is only run as root
+[[ $UID != 0 ]] && exec sudo -E "$(readlink -f "$0")" "$@"
+
+# Functions
+up() {
+    # Terminate network stack management applications
+    #
+    # In the case that this command fails because e.g. none of the applications
+    # is running, just move on because it is not critical in that case
+    #
+    # This is why '|| true' is apppended because true is only called in case
+    # the killall command fails and then true inverts the failed execution to 
+    # a successful execution (errorcode: 0)
+    killall wpa_supplicant dhcpcd unbound || true
+
+    # Unlock the resolv.conf configuration files (just in case)
+    chattr -i /etc/resolv.conf || true
+    chattr -i /etc/netns/physical/resolv.conf || true
+
+    # Set DNS name resolution servers for the root namespace
+    #
+    # In the case of NordVPN you may run 'nordvpn connect ...' to gather the nameservers
+    # that are subsequently written into /etc/resolv.conf - before running this script.
+    #
+    # Further known public DNS resolvers are added to the list (like the ones from
+    # Cloudflare and Google)
+    cat << EOT > /etc/resolv.conf
+nameserver 103.86.96.100
+nameserver 103.86.99.100
+nameserver 1.1.1.1
+nameserver 8.8.8.8
+nameserver 8.8.4.4
+EOT
+
+    # Set DNS name resolution servers for the physical namespace 
+    #
+    # A local DNS stub server run by unbound will be provided in the physical namespace
+    # by binding it to the loopback interface that will be set up for the physical
+    # namespace
+    #
+    # The resolv.conf in /etc/netns/<name of namespace> will be mounted to 
+    # /etc/resolv.conf in the corresponding namespace (namespace-aware utilities/commands like 'ip netns exec' will consider this)
+    mkdir -p /etc/netns/physical
+    cat << EOT > /etc/netns/physical/resolv.conf
+nameserver 127.0.0.1
+nameserver ::1
+options trust-ad
+EOT
+
+    # Lock DNS configuration files in order to make sure that dhcpcd and its configured hooks do not alter
+    # the preceding resolv.conf configurations
+    chattr +i /etc/resolv.conf
+    chattr +i /etc/netns/physical/resolv.conf
+
+    # Create physical namespace
+    ip netns add physical
+
+    # Create Wireguard interface named wgvpn0 in physical namespace
+    ip -n physical link add wgvpn0 type wireguard
+
+    # Reassign Wireguard interface from the physical namespace to the root namespace
+    #
+    # Note: The Wireguard interface detects that is is reassigned from physical namespace
+    # to the root namespace and will thus automatically route all the traffic from the root
+    # namespace via the physical namespace where the real network interfaces will reside.
+    # 
+    # This is the exact reason why the Wireguard interface has been created in the
+    # physical namespace in the first place and is reassigned now to the root namespace.
+    #
+    # The number 1 after netns indicates the Process Identifer of the init process and thus the root namespace
+    # since - by default - all other processes are childs of the init process and thus reside in the same
+    # namespace if not configured or reassigned explicitly otherwise
+    ip -n physical link set wgvpn0 netns 1
+
+    # Configure the Wireguard interface in the root namespace
+    # 
+    # Site note:
+    # The configuration of an already configured Wireguard interface can be
+    # dumped into a configuration file that can be used in conjunction with this
+    # script by invoking a command like the following (replace WIREGUARD_INTERFACE and IDENTIFIER accordingly):
+    # 'wg showconf WIREGUARD_INTERFACE > /etc/wireguard/wgvpn-IDENTIFIER.conf'
+    #
+    # For example: In the case of NordVPN run various 'nordvpn connect ...' before running
+    # this script and then dump each Wireguard configuration into a specific configuration file
+    # by invoking 'wg showconf nordlynx > /etc/wireguard/wgvpn-countryX.conf'
+    # 
+    # For convenience take the first argument (if given) after the argument "up" to apply
+    # a particular configuration
+    if [ ! -z "${1}" ]
+    then
+        wg setconf wgvpn0 "/etc/wireguard/wgvpn0-${1}.conf"
+    else
+        wg setconf wgvpn0 "/etc/wireguard/wgvpn0.conf"
+    fi
+
+    # Set IP address of the Wireguard interface in the root namespace
+    #
+    # In the case of NordVPN you may use the static IP address configuration
+    # that is the same for all Wireguard peers
+    ip addr add 10.5.0.2/32 dev wgvpn0
+
+    # Disable the real interfaces in the root namespace as they are going to be 
+    # reassigned to the physical namespace
+    ip link set enp1s0 down
+    ip link set wlan0 down
+
+    # Enable a loopback device in the physical namespace so that the local
+    # stub DNS server (unbound) can bind to 127.0.0.1/::1 in the physical namespace
+    # as this case is configured in the corresponding resolv.conf configuration
+    # for the physical namespace
+    #
+    # As a result, one loopback interface will reside in each namespace that
+    # is strictly separated from the other one
+    ip netns exec physical ip link set dev lo up
+
+    # Reassign the real interfaces to the physical namespace
+    ip link set enp1s0 netns physical
+    iw phy phy0 set netns name physical
+
+    # Run network stack management applications in the physical namespace
+    ip netns exec physical unbound
+    ip netns exec physical dhcpcd -b enp1s0
+    ip netns exec physical dhcpcd -b wlan0
+    ip netns exec physical wpa_supplicant -B -c/etc/wpa_supplicant/wpa_supplicant-wlan0.conf -iwlan0
+
+    # Activate the Wireguard interface in the root namespace
+    ip link set wgvpn0 up
+
+    # Route all traffic in the root namespace through the Wireguard interface
+    ip route add default dev wgvpn0
+}
+
+down() {
+    # Kill all applications running in the physical namespace if they exist
+    (ip netns pids physical | xargs kill) || true
+
+    # Unlock DNS name resolution configuration files
+    chattr -i /etc/resolv.conf
+    chattr -i /etc/netns/physical/resolv.conf
+
+    # Tidy up DNS name resolution configuration files
+    echo > /etc/resolv.conf
+    echo > /etc/netns/physical/resolv.conf
+
+    # Disable all real network interfaces in the physical namespace
+    ip -n physical link set enp1s0 down
+    ip -n physical link set wlan0 down
+
+    # Reassign the real network interfaces from the physical namespace back to the root namespace
+    ip -n physical link set enp1s0 netns 1
+    ip netns exec physical iw phy phy0 set netns 1
+
+    # Delete the Wireguard interface in the root namespace
+    ip link del wgvpn0
+
+    # Delete the physical namespace
+    ip netns del physical
+}
+
+execi() {
+    # Applications are by default run in the root namespace
+    #
+    # In some cases it can be useful to run an application in the 
+    # physical namespace nonetheless
+    # 
+    # The command 'ip netns exec' needs root privileges that - in this case - 
+    # are dropped afterwards to run the desired command as the user that originally called this routine
+    exec ip netns exec physical sudo -E -u \#${SUDO_UID:-$(id -u)} -g \#${SUDO_GID:-$(id -g)} -- "$@"
+}
+
+# Switch case depending on the first argument passed by and 
+# shift the passed arguments so that the second argument becomes the first one 
+# and the third one the second one and so on. The shifted arguments are then
+# handed over to the corresponding functions
+command="$1"
+shift
+
+case "$command" in
+    # User calls wgphys up ... and this script then calls the up() function defined above
+    up) up "$@" ;;
+
+    # User calls wgphys down ... and this script then calls the down() function defined above
+    down) down "$@" ;;
+
+    # User calls wgphys exec ...  and this script then calls the execi() function defined above
+    exec) execi "$@" ;;
+
+    # User passes another arguments, then this usage hint will be printed
+    *) echo "Usage: $0 up|down|exec" >&2; exit 1 ;;
+esac
