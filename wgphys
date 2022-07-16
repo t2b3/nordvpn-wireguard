@@ -29,6 +29,10 @@ set -ex
 up() {
     # Terminate network stack management applications
     #
+    # Please make sure that none of the network stack management applications used in this script
+    # are called otherwise during runtime (e.g. by systemd to avoid respawning) and 
+    # that no other applications are interfering with this script.
+    #
     # In the case that this command fails because e.g. none of the applications
     # is running, just move on because it is not critical in that case
     #
