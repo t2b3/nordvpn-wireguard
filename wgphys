@@ -86,7 +86,7 @@ EOT
     #
     # Note: The Wireguard interface detects that is is reassigned from physical namespace
     # to the root namespace and will thus automatically route all the traffic from the root
-    # namespace via the physical namespace where the real network interfaces will reside.
+    # namespace in a tunnel through the physical namespace where the real network interfaces will reside.
     # 
     # This is the exact reason why the Wireguard interface has been created in the
     # physical namespace in the first place and is reassigned now to the root namespace.
