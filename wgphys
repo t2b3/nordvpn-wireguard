@@ -8,8 +8,6 @@
 # 'chmod +x THIS_SCRIPT_NAME'.
 #
 # Adapted by Tobias Predel in the year 2022 for the NordVPN use case
-# This uses unbound as local DNS resolver that will reside in the physical namespace.
-# DNS resolution for the root namespace will be done via external DNS resolvers.
 #
 # Sources (also worth reading):
 # 1. https://www.wireguard.com/netns/ (especially the section about 
@@ -25,6 +23,15 @@ set -ex
 # Make sure that this script is only run as root
 [[ $UID != 0 ]] && exec sudo -E "$(readlink -f "$0")" "$@"
 
+# Ethernet devices array
+ethernet=( enp1s0 enp0s20f0u1u3 )
+
+# Wireless devices array
+wireless=( wlan0 )
+
+# Wireless physical devices array (must map o:o with the wireless array above)
+wireless_physical=( phy0 )
+
 # Functions
 up() {
     # Terminate network stack management applications
@@ -39,11 +46,12 @@ up() {
     # This is why '|| true' is apppended because true is only called in case
     # the killall command fails and then true inverts the failed execution to 
     # a successful execution (errorcode: 0)
-    killall wpa_supplicant dhcpcd unbound || true
+    killall wpa_supplicant dhcpcd || true
 
     # Unlock the resolv.conf configuration files (just in case)
-    chattr -i /etc/resolv.conf || true
-    chattr -i /etc/netns/physical/resolv.conf || true
+    # chattr -i /etc/resolv.conf || true
+    # chattr -i /etc/netns/physical/resolv.conf || true
+
 
     # Set DNS name resolution servers for the root namespace
     #
@@ -60,28 +68,42 @@ nameserver 8.8.8.8
 nameserver 8.8.4.4
 EOT
 
-    # Set DNS name resolution servers for the physical namespace 
-    #
-    # A local DNS stub server run by unbound will be provided in the physical namespace
-    # by binding it to the loopback interface that will be set up for the physical
-    # namespace
+    # Set DNS name resolution servers for the physical namespace (let that by handled by dhcpcd) 
     #
     # The resolv.conf in /etc/netns/<name of namespace> will be mounted to 
     # /etc/resolv.conf in the corresponding namespace (namespace-aware utilities/commands like 'ip netns exec' will consider this)
     mkdir -p /etc/netns/physical
-    cat << EOT > /etc/netns/physical/resolv.conf
-nameserver 127.0.0.1
-nameserver ::1
-options trust-ad
-EOT
-
-    # Lock DNS configuration files in order to make sure that dhcpcd and its configured hooks do not alter
-    # the preceding resolv.conf configurations
-    chattr +i /etc/resolv.conf
-    chattr +i /etc/netns/physical/resolv.conf
 
     # Create physical namespace
     ip netns add physical
+
+    # Enable a loopback device in the physical namespace so that a local
+    # server can bind to 127.0.0.1/::1 in the physical namespace
+    # as this case is configured in the corresponding resolv.conf configuration
+    # for the physical namespace
+    #
+    # As a result, one loopback interface will reside in each namespace that
+    # is strictly separated from the other one
+    ip netns exec physical ip link set dev lo up
+
+    # Disable the real interfaces in the root namespace as they are going to be 
+    # reassigned to the physical namespace
+
+    for i in "${!ethernet[@]}"
+    do
+        ip link set ${ethernet[i]} down
+        ip link set ${ethernet[i]} netns physical
+        ip netns exec physical dhcpcd -b ${ethernet[i]}
+    done
+
+    for j in "${!wireless[@]}"
+    do
+        ip link set ${wireless[j]} down
+#       ip link set $j netns physical
+        iw phy ${wireless_physical[j]} set netns name physical
+        ip netns exec physical dhcpcd -b ${wireless[j]}
+        ip netns exec physical wpa_supplicant -B -c/etc/wpa_supplicant/wpa_supplicant-${wireless[j]}.conf -i${wireless[j]}
+    done
 
     # Create Wireguard interface named wgvpn0 in physical namespace
     ip -n physical link add wgvpn0 type wireguard
@@ -127,30 +149,6 @@ EOT
     # that is the same for all Wireguard peers
     ip addr add 10.5.0.2/32 dev wgvpn0
 
-    # Disable the real interfaces in the root namespace as they are going to be 
-    # reassigned to the physical namespace
-    ip link set enp1s0 down
-    ip link set wlan0 down
-
-    # Enable a loopback device in the physical namespace so that the local
-    # stub DNS server (unbound) can bind to 127.0.0.1/::1 in the physical namespace
-    # as this case is configured in the corresponding resolv.conf configuration
-    # for the physical namespace
-    #
-    # As a result, one loopback interface will reside in each namespace that
-    # is strictly separated from the other one
-    ip netns exec physical ip link set dev lo up
-
-    # Reassign the real interfaces to the physical namespace
-    ip link set enp1s0 netns physical
-    iw phy phy0 set netns name physical
-
-    # Run network stack management applications in the physical namespace
-    ip netns exec physical unbound
-    ip netns exec physical dhcpcd -b enp1s0
-    ip netns exec physical dhcpcd -b wlan0
-    ip netns exec physical wpa_supplicant -B -c/etc/wpa_supplicant/wpa_supplicant-wlan0.conf -iwlan0
-
     # Activate the Wireguard interface in the root namespace
     ip link set wgvpn0 up
 
@@ -162,21 +160,23 @@ down() {
     # Kill all applications running in the physical namespace if they exist
     (ip netns pids physical | xargs kill) || true
 
-    # Unlock DNS name resolution configuration files
-    chattr -i /etc/resolv.conf
-    chattr -i /etc/netns/physical/resolv.conf
-
     # Tidy up DNS name resolution configuration files
     echo > /etc/resolv.conf
     echo > /etc/netns/physical/resolv.conf
 
     # Disable all real network interfaces in the physical namespace
-    ip -n physical link set enp1s0 down
-    ip -n physical link set wlan0 down
 
-    # Reassign the real network interfaces from the physical namespace back to the root namespace
-    ip -n physical link set enp1s0 netns 1
-    ip netns exec physical iw phy phy0 set netns 1
+    for k in "${!ethernet[@]}"
+    do
+       ip -n physical link set ${ethernet[k]} down
+       ip -n physical link set ${ethernet[k]} netns 1
+    done
+
+    for l in "${!wireless[@]}"
+    do
+        ip -n physical link set ${wireless[l]} down
+        ip netns exec physical iw phy ${wireless_physical[l]} set netns 1
+    done
 
     # Delete the Wireguard interface in the root namespace
     ip link del wgvpn0
